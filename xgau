@@ -1,0 +1,159 @@
+#! /usr/bin/env python3
+import sys
+import argparse
+from urllib3.util import parse_url
+import os
+import signal
+import subprocess
+import re 
+import xml.etree.ElementTree as ET
+from base64 import b64decode
+from collections import Counter
+
+ENV = os.environ.copy()
+HOME = ENV["HOME"]
+ENV["PATH"] = f"/usr/local/go/bin:{HOME}/go/bin/:{ENV['PATH']}"
+
+RED = '\x1b[31m'
+GREEN = '\x1b[32m'
+RESET = '\x1b[39m'
+g = lambda s:  f"{GREEN}{s}{RESET}"
+r = lambda s:  f"{RED}{s}{RESET}"
+red = lambda s: print(f"[{RED}-{RESET}] {s}", file=sys.stderr)
+green = lambda s: print(f"[{GREEN}+{RESET}] {s}", file=sys.stderr)
+
+
+def handle_interrupt(signum, frame):
+    red("Ctrl+C pressed. Exiting gracefully.")
+    exit(1)
+
+# Register the signal handler for Ctrl+C (SIGINT)
+signal.signal(signal.SIGINT, handle_interrupt)
+
+GO_TOOLS = [
+    ("katana", "github.com/projectdiscovery/subfinder/v2/cmd/katana@latest"),
+    ("waybackurls", "github.com/tomnomnom/waybackurls@latest"),
+    ("unfurl", "wget https://github.com/tomnomnom/unfurl/releases/download/v0.4.3/unfurl-linux-amd64-0.4.3.tgz && tar xzf unfurl-linux-amd64-0.4.3.tgz && mv unfurl {HOME}/go/bin/")
+]
+
+def run(cmd, shell=True, silent=False):
+    kwargs = {"stderr": subprocess.DEVNULL}
+    res = subprocess.check_output(cmd, shell=shell, env=ENV, universal_newlines=True, **kwargs)
+    return res.strip()
+
+def clean_params(params):
+    item_counts = Counter(params)
+
+    # remove duplicates, filter by length, and sort by count
+    filtered = sorted(
+        (item for item in set(params) if len(item) < 25),
+        key=lambda x: (item_counts[x], x),
+        reverse=True
+    )
+    return filtered
+
+run(f"mkdir -p {HOME}/go/bin/", silent=True)
+
+def install_go_tools():
+    for tool, install_cmd in GO_TOOLS:
+        installed = is_installed(tool)
+        if installed != 0:
+            green(f"installing {g(tool)} ...")
+            run(f"{install_cmd}")
+
+
+
+def is_installed(name):
+    kwargs = {"stderr": subprocess.DEVNULL,"stdout": subprocess.DEVNULL}
+    return subprocess.run(f"command -v {name}", shell=True, env=ENV, universal_newlines=True, **kwargs).returncode
+    
+
+def find_param(text):
+    # Define a regular expression patterns
+    patterns = [
+        r"(?:var|const|let)\s+([a-zA-Z_]\w*)\s*=",  # JavaScript variable
+        r"(?:\"|\')([\w\d]+)(?:\"|\')(?:\:\s*)(?:\"|\')?[\w\s-]*(?:\"|\')?",  # json keys
+        r"<input (?:[^>]*id=[\"']([^'\"]+)|)",  # input id
+        r"<input (?:[^>]*name=[\"']([^'\"]*)|)",  # input name
+    ]
+
+    params = set()
+
+    # Find all matches of the pattern in code
+    for i in patterns:
+        params = params ^ set(re.findall(i, text))
+
+    return params
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Crawl webpage, use waybackmachine and crawl BurpSuite result to find URLs and parameters.")
+    parser.add_argument("target", type=str, help="URL or domain.")
+    parser.add_argument("-b", "--burp", type=argparse.FileType(), help="BurpSuite XML output.")
+    parser.add_argument("-w","--wayback", action='store_true', help="Get URLs from waybackmachine.")
+    parser.add_argument("-p","--passive", action='store_true', help="Do not active scan target.")
+    parser.add_argument("-k","--katana", default="", help="Extra katana switches.")
+
+    args = parser.parse_args()
+    u_p = parse_url(args.target)
+    params_filename = f"{u_p.hostname}-params.txt"
+    urls_filename = f"{u_p.hostname}-urls.txt"
+    urls = set()
+    params = []
+    
+    if args.wayback:
+        green(f"Search in {g('WaybackMachine')}")
+        cmd = f'waybackurls {args.target} | grep -E -v "(\\.tif|\\.tiff|\\.ttf|\\.woff|\\.woff2|\\.ico|\\.css)$"'
+        urls ^= set(run(cmd).split('\n'))
+
+
+    if not args.passive:
+        green(f"Active crawling ...")
+        cmd = f"katana -silent -u {args.target} {args.katana} -ef tif,tiff,ttf,woff,woff2,ico,css -xhr -aff -kf all -fx -jsl -jc -f qurl -sf params,key"
+        urls ^= set(run(cmd).split('\n'))
+        params += run(f"cat ./katana_field/*").split('\n')
+        
+        run(f"rm ./katana_field/ -rf", silent=True)
+    
+    if args.burp:
+        
+        tree = ET.parse(args.burp)
+        root = tree.getroot()
+        
+        green(f"Extract data from {g('BurpSuite')} result.")
+        
+        # extract urls
+        urls ^= {i.find('url').text for i in root}
+        
+        # TODO: Extract URLs from burp response
+        
+        # extract parameters
+        responses = {i.find('response').text for i in root}
+        
+        text = ""
+        for res in responses:
+            text += b64decode(res).decode()
+        
+        params += list(find_param(text))
+    
+    with open(urls_filename, 'w') as f:
+        f.write('\n'.join(urls))
+    
+    green(f"URLs are at {g(urls_filename)}")
+    
+    params += run(f"cat {urls_filename} | unfurl keys").split('\n')
+    
+    params = clean_params(params)
+    
+    with open(params_filename, 'w') as f:
+        f.write('\n'.join(params))
+    
+    green(f"Paramters are at {g(params_filename)}")
+
+
+if __name__ == "__main__":
+    go = is_installed('go')
+    if go != 0:
+      red("Make sure go is in your PATH.")
+
+    main()

@@ -1,0 +1,9 @@
+- name: params
+  type: regex
+  part: response
+  group: 1
+  regex:
+  - <input (?:[^>]*name=["']([^'"]*)|)
+  - <input (?:[^>]*id=["']([^'"]+)|)
+  - (?:\"|\')([\w\d]+)(?:\"|\')(?:\:\s*)(?:\"|\')?[\w\s-]*(?:\"|\')?
+  - (?:var|const|let)\s+([a-zA-Z_]\w*)\s*=
